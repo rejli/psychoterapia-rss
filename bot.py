@@ -33,8 +33,21 @@ from email.utils import format_datetime
 # USTAWIENIA - to możesz zmieniać
 # ----------------------------------------------------------------------
 
-# Model AI na OpenRouter (identyfikator ze strony openrouter.ai/models).
-MODEL = "mistralai/mistral-small-3.2-24b-instruct"
+# Modele AI na OpenRouter (identyfikatory ze strony openrouter.ai/models).
+# Podział pracy: tani model OCENIA trafność wszystkich prac, a mocniejszy
+# PISZE polski tytuł i streszczenie tylko dla tych, które przeszły próg.
+MODEL = "mistralai/mistral-small-3.2-24b-instruct"   # ocena trafności (wszystkie prace)
+MODEL_PISARZ = "anthropic/claude-haiku-5.5"          # polskie tytuły i streszczenia (prace nad progiem)
+
+# Dodatkowe opcje zapytania dla modelu-pisarza. To zadanie (tłumaczenie,
+# streszczanie) nie wymaga rozumowania, a włączone "myślenie" pali tokeny
+# wyjścia i podnosi koszt kilkukrotnie - dlatego je wyłączamy.
+# Uwaga przy zmianie modelu-pisarza:
+#   - modele, których reasoningu NIE da się wyłączyć (np. claude-sonnet-5.5,
+#     openai/gpt-5*), odrzucą {"enabled": False} błędem 400 - ustaw wtedy
+#     {"reasoning": {"effort": "minimal"}} albo zostaw pusty słownik {};
+#   - modele nierozumujące (np. mistral, gemini-flash) ignorują ten parametr.
+PISARZ_OPCJE = {"reasoning": {"enabled": False}}
 
 # Czego szukać w PubMed. Dopisz lub usuń hasła według potrzeb.
 TEMATY = [
@@ -104,7 +117,9 @@ MAKS_DONIESIEN_OCENA = 6        # ile doniesień RSS oceniać modelem
 MAKS_NOWYCH_PREPRINTY = 3       # ile najwyżej nowych preprintów na uruchomienie
 MAKS_NOWYCH_DONIESIEN = 3       # ile najwyżej nowych doniesień na uruchomienie
 MIN_OCENA_DONIESIENIE = 6       # minimalna trafność doniesienia, żeby trafiło do kanału
-# Łączny budżet zapytań do modelu na uruchomienie: 40 + 8 + 6 + 6 = maks. 60.
+# Budżet zapytań OCENY (tani model) na uruchomienie: 40 + 8 + 6 + 6 = maks. 60.
+# Do tego dochodzą zapytania PISANIA (mocniejszy model) - po jednym na każdą
+# pracę/doniesienie nad progiem (maks. MAKS_NOWYCH + preprinty + doniesienia).
 
 # Kontakt dla "grzecznej puli" OpenAlex (opcjonalny). Zostaw pusty, działa i tak.
 OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO", "").strip()
@@ -416,21 +431,46 @@ def pobierz_doniesienia():
 
 # ---------------------------- Model AI --------------------------------
 
-INSTRUKCJA = """Jesteś redaktorem naukowym, który przygotowuje po polsku przegląd badań dla psychoterapeuty.
-Dostaniesz tytuł, typ publikacji i abstrakt artykułu naukowego.
+# Słowniczek polskich odpowiedników terminów z psychoterapii, psychologii
+# klinicznej i metodologii badań. Dołączany do promptów modelu-pisarza, żeby
+# nie tłumaczył fachowych pojęć dosłownie (np. "therapeutic alliance" jako
+# "sołectwo terapeutyczne"). Dopisuj/poprawiaj według potrzeb.
+SLOWNICZEK = """SŁOWNICZEK - stosuj te polskie odpowiedniki (nie tłumacz ich dosłownie):
+Nurty i interwencje: cognitive behavioral/behavioural therapy (CBT) -> terapia poznawczo-behawioralna (CBT); third-wave therapies -> terapie trzeciej fali; schema therapy -> terapia schematów; psychodynamic psychotherapy -> psychoterapia psychodynamiczna; dialectical behavior therapy (DBT) -> dialektyczna terapia behawioralna (DBT); acceptance and commitment therapy (ACT) -> terapia akceptacji i zaangażowania (ACT); mentalization-based therapy (MBT) -> terapia oparta na mentalizacji (MBT); gestalt therapy -> terapia Gestalt; prolonged exposure -> przedłużona ekspozycja; exposure and response prevention (ERP) -> ekspozycja z powstrzymaniem reakcji; mindfulness-based cognitive therapy (MBCT) -> terapia poznawcza oparta na uważności; mindfulness-based stress reduction (MBSR) -> redukcja stresu oparta na uważności (MBSR); interpersonal psychotherapy (IPT) -> psychoterapia interpersonalna (IPT); compassion-focused therapy (CFT) -> terapia skoncentrowana na współczuciu; emotion-focused therapy (EFT) -> terapia skoncentrowana na emocjach; motivational interviewing -> dialog motywujący; psychoeducation -> psychoedukacja. EMDR i IFS zostawiaj jako skróty.
+Proces terapii: therapeutic/working alliance -> przymierze terapeutyczne (NIE "sołectwo"); therapeutic relationship -> relacja terapeutyczna; common factors -> czynniki wspólne; (treatment) outcome -> wynik/efekt terapii; dropout -> przedwczesne zakończenie terapii; adherence -> zależnie od kontekstu: u pacjenta "stosowanie się do zaleceń", u terapeuty "wierność protokołowi terapii"; rupture and repair -> zerwanie i naprawa przymierza; motivation for change -> motywacja do zmiany; mental distress -> dystres psychiczny; treatment as usual (TAU) -> leczenie standardowe (TAU); waitlist control -> grupa z listy oczekujących; case formulation -> konceptualizacja przypadku; transference/countertransference -> przeniesienie/przeciwprzeniesienie.
+Zaburzenia (ICD-11, PL): internet use disorder -> zaburzenie używania internetu (NIE "internetowe zaburzenie używania"); gaming disorder -> zaburzenie grania w gry; major depressive disorder -> duże zaburzenie depresyjne; generalized anxiety disorder -> zaburzenie lękowe uogólnione; post-traumatic stress disorder (PTSD) -> zespół stresu pourazowego (PTSD); complex PTSD -> złożony zespół stresu pourazowego (cPTSD); obsessive-compulsive disorder (OCD) -> zaburzenie obsesyjno-kompulsyjne; borderline personality disorder -> zaburzenie osobowości typu borderline; bipolar disorder -> zaburzenie afektywne dwubiegunowe; eating disorders -> zaburzenia odżywiania; substance use disorder -> zaburzenie używania substancji; social anxiety disorder -> zaburzenie lęku społecznego; panic disorder -> zaburzenie lękowe z napadami paniki; prolonged grief disorder -> przedłużona reakcja żałoby.
+Metodologia i statystyka: randomized controlled trial (RCT) -> badanie z randomizacją (RCT); meta-analysis -> metaanaliza; network meta-analysis -> sieciowa metaanaliza; systematic review -> przegląd systematyczny; scoping review -> przegląd zakresowy (scoping review); effect size -> wielkość efektu; confidence interval (CI) -> przedział ufności (CI); odds ratio -> iloraz szans; risk ratio/relative risk -> ryzyko względne; standardized mean difference (SMD) -> standaryzowana różnica średnich (SMD); Cohen's d -> d Cohena; Hedges' g -> g Hedgesa; p-value -> wartość p; number needed to treat -> liczba konieczna do leczenia (NNT); moderator/mediator -> moderator/mediator; heterogeneity -> heterogeniczność; intention-to-treat -> analiza zgodna z zamiarem leczenia (ITT); follow-up -> obserwacja odległa; baseline -> poziom wyjściowy; sample size -> wielkość próby; blinding -> zaślepienie.
+ZASADA OGÓLNA: jeśli termin NIE ma utrwalonego polskiego odpowiednika, zostaw go po angielsku (ewentualnie w cudzysłowie), zamiast tłumaczyć dosłownie. Nazw własnych narzędzi, kwestionariuszy i skrótów nie tłumacz."""
 
-Zasady:
-- Opieraj się WYŁĄCZNIE na abstrakcie. Nie dodawaj liczb, wyników ani wniosków, których w nim nie ma.
-- Jeśli jakiejś informacji nie ma w abstrakcie, napisz "nie podano w abstrakcie".
-- Pisz zwięźle, konkretnie, zrozumiałym językiem. Liczby (wielkość próby, wielkości efektu, przedziały ufności) przepisuj dokładnie.
-- Nie wyolbrzymiaj: wyniki małych, wstępnych lub obserwacyjnych badań opisuj ostrożnie.
+
+# --- Prompt OCENY (tani model, wszystkie prace): tylko trafność + typ ---
+INSTRUKCJA_OCENA = """Jesteś redaktorem naukowym. Oceniasz, czy artykuł naukowy jest wart uwagi psychoterapeuty, i klasyfikujesz jego typ.
+Dostaniesz tytuł, typ publikacji i abstrakt artykułu naukowego. Opieraj się wyłącznie na abstrakcie.
 
 Zainteresowania czytelnika: {zainteresowania}
 
 Zwróć wyłącznie obiekt JSON z polami:
 - "trafnosc": liczba całkowita 1-10. Jak bardzo artykuł jest wart uwagi czytelnika. 8-10: metaanalizy, duże badania z randomizacją, ważne badania procesu terapii. 5-7: solidne badania o węższym znaczeniu. 1-4: protokoły bez wyników, badania czysto farmakologiczne lub biologiczne, tematy luźno związane z psychoterapią, bardzo małe badania pilotażowe.
-- "typ_badania": dokładnie jedna z wartości: {etykiety}
-- "tytul_pl": tytuł artykułu przetłumaczony na polski
+- "typ_badania": dokładnie jedna z wartości: {etykiety}"""
+
+
+# --- Prompt PISANIA (mocniejszy model, prace nad progiem): polskie streszczenie ---
+INSTRUKCJA_PISANIE = """Jesteś redaktorem naukowym, który przygotowuje po polsku przegląd badań dla psychoterapeuty.
+Dostaniesz tytuł, typ publikacji i abstrakt artykułu, który już uznano za wart publikacji.
+
+Zasady:
+- Opieraj się WYŁĄCZNIE na abstrakcie. Nie dodawaj liczb, wyników ani wniosków, których w nim nie ma.
+- Jeśli jakiejś informacji nie ma w abstrakcie, napisz "nie podano w abstrakcie".
+- Pisz zwięźle, konkretnie, poprawną polszczyzną. Liczby (wielkość próby, wielkości efektu, przedziały ufności) przepisuj dokładnie.
+- Nie wyolbrzymiaj: wyniki małych, wstępnych lub obserwacyjnych badań opisuj ostrożnie.
+- Terminologię fachową tłumacz zgodnie z poniższym słowniczkiem.
+
+{slowniczek}
+
+Zainteresowania czytelnika: {zainteresowania}
+
+Zwróć wyłącznie obiekt JSON z polami:
+- "tytul_pl": tytuł artykułu po polsku
 - "streszczenie": 2-3 zdania: co badano i dlaczego
 - "metoda": 1-2 zdania: rodzaj badania, uczestnicy, wielkość próby, porównywane warunki
 - "wynik": 1-3 zdania: najważniejsze wyniki z liczbami, jeśli są w abstrakcie
@@ -438,19 +478,30 @@ Zwróć wyłącznie obiekt JSON z polami:
 - "wniosek_dla_praktyki": 1-2 zdania: co z tego wynika dla pracy psychoterapeuty"""
 
 
-INSTRUKCJA_DONIESIENIE = """Jesteś redaktorem, który po polsku streszcza KRÓTKĄ NOTKĘ PRASOWĄ o badaniu z psychologii.
+# --- Doniesienia RSS: osobne, prostsze prompty (ocena taniego, pisanie mocnego) ---
+INSTRUKCJA_OCENA_DONIESIENIE = """Oceniasz krótką notkę prasową o badaniu z psychologii. Dostajesz tylko krótki opis z kanału informacyjnego, NIE abstrakt naukowy.
+
+Zainteresowania czytelnika: {zainteresowania}
+
+Zwróć wyłącznie obiekt JSON z jednym polem:
+- "trafnosc": liczba całkowita 1-10. Jak bardzo doniesienie dotyczy psychoterapii/psychologii klinicznej i jest warte uwagi czytelnika."""
+
+
+INSTRUKCJA_PISANIE_DONIESIENIE = """Jesteś redaktorem, który po polsku streszcza KRÓTKĄ NOTKĘ PRASOWĄ o badaniu z psychologii.
 UWAGA: dostajesz wyłącznie krótki opis prasowy z kanału informacyjnego, a NIE abstrakt naukowy.
 
 Zasady:
 - Opieraj się WYŁĄCZNIE na podanym opisie. Nie dodawaj żadnych liczb, wielkości próby ani wyników, których w opisie nie ma.
 - NIE przypisuj typu badania (nie pisz, że to RCT, metaanaliza, przegląd itp.), nawet jeśli się domyślasz.
-- Pisz zwięźle i ostrożnie. To doniesienie popularnonaukowe, nie recenzowany artykuł.
+- Pisz zwięźle i ostrożnie, poprawną polszczyzną. To doniesienie popularnonaukowe, nie recenzowany artykuł.
+- Terminologię fachową tłumacz zgodnie z poniższym słowniczkiem.
+
+{slowniczek}
 
 Zainteresowania czytelnika: {zainteresowania}
 
 Zwróć wyłącznie obiekt JSON z polami:
-- "trafnosc": liczba całkowita 1-10. Jak bardzo doniesienie dotyczy psychoterapii/psychologii klinicznej i jest warte uwagi czytelnika.
-- "tytul_pl": tytuł doniesienia przetłumaczony na polski
+- "tytul_pl": tytuł doniesienia po polsku
 - "streszczenie": 2-3 zdania po polsku: czego dotyczy doniesienie, wyłącznie na podstawie opisu"""
 
 
@@ -462,8 +513,34 @@ def wyciagnij_json(odpowiedz):
     return json.loads(odpowiedz[poczatek:koniec + 1])
 
 
-def ocen_i_streszcz(artykul, klucz):
-    system = INSTRUKCJA.format(
+def _zapytaj_model(model, system, uzytkownik, klucz, max_tokens, opcje=None):
+    """Jedno zapytanie czatowe do OpenRouter; zwraca sparsowany JSON z odpowiedzi."""
+    dane = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": uzytkownik},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }
+    if opcje:
+        dane.update(opcje)
+    naglowki = {"Authorization": f"Bearer {klucz}", "Content-Type": "application/json"}
+    wynik = http_post_json(OPENROUTER, dane, naglowki)
+    if "choices" not in wynik:
+        raise RuntimeError(f"nieoczekiwana odpowiedź OpenRouter: {json.dumps(wynik)[:300]}")
+    tresc = wynik["choices"][0]["message"].get("content")
+    if not tresc:  # modele rozumujące potrafią zwrócić pusty content
+        powod = wynik["choices"][0].get("finish_reason")
+        raise RuntimeError(f"pusty content modelu (finish_reason={powod})")
+    return wyciagnij_json(tresc)
+
+
+def ocen_trafnosc(artykul, klucz):
+    """TANI model: ocenia trafność (1-10) i typ badania. Dla wszystkich prac."""
+    system = INSTRUKCJA_OCENA.format(
         zainteresowania=ZAINTERESOWANIA, etykiety=", ".join(DOZWOLONE_ETYKIETY))
     uzytkownik = (
         f"Tytuł: {artykul['tytul']}\n"
@@ -471,58 +548,67 @@ def ocen_i_streszcz(artykul, klucz):
         f"Typ publikacji wg PubMed: {', '.join(artykul['typy']) or 'brak'}\n\n"
         f"Abstrakt:\n{artykul['abstrakt'][:6000]}"
     )
-    dane = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": uzytkownik},
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-        "max_tokens": 1000,
-    }
-    naglowki = {"Authorization": f"Bearer {klucz}", "Content-Type": "application/json"}
-    wynik = http_post_json(OPENROUTER, dane, naglowki)
-    if "choices" not in wynik:
-        raise RuntimeError(f"nieoczekiwana odpowiedź OpenRouter: {json.dumps(wynik)[:300]}")
-    s = wyciagnij_json(wynik["choices"][0]["message"]["content"])
+    s = _zapytaj_model(MODEL, system, uzytkownik, klucz, max_tokens=300)
     try:
         s["trafnosc"] = int(s.get("trafnosc", 0))
     except (TypeError, ValueError):
         s["trafnosc"] = 0
     if s.get("typ_badania") not in DOZWOLONE_ETYKIETY:
         s["typ_badania"] = "Inne"
+    return s
+
+
+def napisz_po_polsku(artykul, klucz):
+    """MOCNIEJSZY model: pisze polski tytuł i streszczenie. Tylko dla prac nad progiem.
+    Gdy model-pisarz zawiedzie (np. błąd dostawcy), awaryjnie pisze tańszy model."""
+    system = INSTRUKCJA_PISANIE.format(
+        slowniczek=SLOWNICZEK, zainteresowania=ZAINTERESOWANIA)
+    uzytkownik = (
+        f"Tytuł: {artykul['tytul']}\n"
+        f"Czasopismo: {artykul['czasopismo']}\n"
+        f"Typ publikacji wg PubMed: {', '.join(artykul['typy']) or 'brak'}\n\n"
+        f"Abstrakt:\n{artykul['abstrakt'][:6000]}"
+    )
+    try:
+        s = _zapytaj_model(MODEL_PISARZ, system, uzytkownik, klucz, max_tokens=1200, opcje=PISARZ_OPCJE)
+    except Exception as e:
+        print(f"    pisarz {MODEL_PISARZ} zawiódł ({e}); piszę tańszym modelem")
+        s = _zapytaj_model(MODEL, system, uzytkownik, klucz, max_tokens=1200)
     for pole in ("tytul_pl", "streszczenie", "metoda", "wynik", "ograniczenia", "wniosek_dla_praktyki"):
         s[pole] = str(s.get(pole) or "nie podano w abstrakcie").strip()
     return s
 
 
-def streszcz_doniesienie(poz, klucz):
-    system = INSTRUKCJA_DONIESIENIE.format(zainteresowania=ZAINTERESOWANIA)
+def ocen_trafnosc_doniesienie(poz, klucz):
+    """TANI model: ocenia trafność doniesienia RSS (1-10)."""
+    system = INSTRUKCJA_OCENA_DONIESIENIE.format(zainteresowania=ZAINTERESOWANIA)
     uzytkownik = (
         f"Tytuł: {poz['tytul']}\n"
         f"Kanał: {poz['zrodlo']}\n\n"
         f"Opis z kanału:\n{poz['opis']}"
     )
-    dane = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": uzytkownik},
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-        "max_tokens": 500,
-    }
-    naglowki = {"Authorization": f"Bearer {klucz}", "Content-Type": "application/json"}
-    wynik = http_post_json(OPENROUTER, dane, naglowki)
-    if "choices" not in wynik:
-        raise RuntimeError(f"nieoczekiwana odpowiedź OpenRouter: {json.dumps(wynik)[:300]}")
-    s = wyciagnij_json(wynik["choices"][0]["message"]["content"])
+    s = _zapytaj_model(MODEL, system, uzytkownik, klucz, max_tokens=120)
     try:
         s["trafnosc"] = int(s.get("trafnosc", 0))
     except (TypeError, ValueError):
         s["trafnosc"] = 0
+    return s
+
+
+def napisz_doniesienie(poz, klucz):
+    """MOCNIEJSZY model: pisze polski tytuł i streszczenie doniesienia. Tylko nad progiem."""
+    system = INSTRUKCJA_PISANIE_DONIESIENIE.format(
+        slowniczek=SLOWNICZEK, zainteresowania=ZAINTERESOWANIA)
+    uzytkownik = (
+        f"Tytuł: {poz['tytul']}\n"
+        f"Kanał: {poz['zrodlo']}\n\n"
+        f"Opis z kanału:\n{poz['opis']}"
+    )
+    try:
+        s = _zapytaj_model(MODEL_PISARZ, system, uzytkownik, klucz, max_tokens=600, opcje=PISARZ_OPCJE)
+    except Exception as e:
+        print(f"    pisarz {MODEL_PISARZ} zawiódł ({e}); piszę tańszym modelem")
+        s = _zapytaj_model(MODEL, system, uzytkownik, klucz, max_tokens=600)
     s["tytul_pl"] = str(s.get("tytul_pl") or poz["tytul"]).strip()
     s["streszczenie"] = str(s.get("streszczenie") or "").strip()
     return s
@@ -537,17 +623,24 @@ def ocen_liste(kandydaci, klucz, stan, widziane_pmid, licznik):
     for i, a in enumerate(kandydaci, 1):
         licznik[0] += 1
         try:
-            s = ocen_i_streszcz(a, klucz)
+            ocena = ocen_trafnosc(a, klucz)
         except Exception as e:  # jeden nieudany artykuł nie zatrzymuje reszty
             licznik[1] += 1
-            print(f"  [{a['zrodlo']}] [{i}/{len(kandydaci)}] BŁĄD: {e}")
+            print(f"  [{a['zrodlo']}] [{i}/{len(kandydaci)}] BŁĄD oceny: {e}")
             continue
         if a.get("pmid"):
             stan["widziane"].append(a["pmid"])
             widziane_pmid.add(a["pmid"])
         stan["widziane_klucze"].append(a["klucz"])
-        print(f"  [{a['zrodlo']}] [{i}/{len(kandydaci)}] trafność {s['trafnosc']}: {a['tytul'][:60]}")
-        if s["trafnosc"] >= MIN_OCENA:
+        print(f"  [{a['zrodlo']}] [{i}/{len(kandydaci)}] trafność {ocena['trafnosc']}: {a['tytul'][:60]}")
+        if ocena["trafnosc"] >= MIN_OCENA:
+            licznik[0] += 1
+            try:  # praca nad progiem - polskie streszczenie pisze mocniejszy model
+                s = {**ocena, **napisz_po_polsku(a, klucz)}
+            except Exception as e:
+                licznik[1] += 1
+                print(f"  [{a['zrodlo']}] [{i}/{len(kandydaci)}] BŁĄD pisania, pomijam: {e}")
+                continue
             if a.get("doi"):
                 link = "https://doi.org/" + doi_do_linku(a["doi"])
             elif a.get("pmid"):
@@ -574,15 +667,22 @@ def ocen_doniesienia(pozycje, klucz, stan, uzyte_klucze, licznik):
         proby += 1
         licznik[0] += 1
         try:
-            s = streszcz_doniesienie(p, klucz)
+            ocena = ocen_trafnosc_doniesienie(p, klucz)
         except Exception as e:
             licznik[1] += 1
-            print(f"  [{p['zrodlo']}] BŁĄD: {e}")
+            print(f"  [{p['zrodlo']}] BŁĄD oceny: {e}")
             continue
         stan["widziane_klucze"].append(k)
-        print(f"  [{p['zrodlo']}] trafność {s['trafnosc']}: {p['tytul'][:60]}")
-        if s["trafnosc"] >= MIN_OCENA_DONIESIENIE:
-            wpisy.append({"trafnosc": s["trafnosc"], "tytul_pl": s["tytul_pl"],
+        print(f"  [{p['zrodlo']}] trafność {ocena['trafnosc']}: {p['tytul'][:60]}")
+        if ocena["trafnosc"] >= MIN_OCENA_DONIESIENIE:
+            licznik[0] += 1
+            try:  # doniesienie nad progiem - polskie streszczenie pisze mocniejszy model
+                s = napisz_doniesienie(p, klucz)
+            except Exception as e:
+                licznik[1] += 1
+                print(f"  [{p['zrodlo']}] BŁĄD pisania, pomijam: {e}")
+                continue
+            wpisy.append({"trafnosc": ocena["trafnosc"], "tytul_pl": s["tytul_pl"],
                           "streszczenie": s["streszczenie"], "tytul": p["tytul"],
                           "link": p["link"], "zrodlo": p["zrodlo"], "rodzaj": "doniesienie",
                           "autor": "", "czasopismo": "", "guid": k, "klucz": k})
@@ -735,8 +835,8 @@ def main():
     poz_doniesienia = bezpiecznie("Doniesienia", pobierz_doniesienia)
     print(f"  znaleziono pozycji: {len(poz_doniesienia)}")
 
-    # --- Ocena modelem (wspólny budżet, maks. ok. 60 zapytań) ---
-    print(f"Oceniam modelem {MODEL}...")
+    # --- Ocena (tani model) + pisanie polskich streszczeń (mocniejszy model) ---
+    print(f"Oceniam trafność modelem {MODEL}; streszczenia pisze {MODEL_PISARZ}...")
     wpisy_pubmed = ocen_liste(kand_pubmed, klucz, stan, widziane_pmid, licznik)
     wpisy_openalex = ocen_liste(kand_openalex, klucz, stan, widziane_pmid, licznik)
     wpisy_pre = ocen_liste(kand_pre, klucz, stan, widziane_pmid, licznik)

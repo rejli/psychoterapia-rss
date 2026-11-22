@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Lokalny klucz API do testów (NIGDY nie commitować)
+.openrouter_key
+.env
